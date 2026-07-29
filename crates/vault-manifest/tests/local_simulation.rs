@@ -23,7 +23,7 @@ impl Agent {
         self.manifest.put(
             path,
             Entry {
-                blob_hash: blob_hash.to_string(),
+                chunk_hashes: vec![blob_hash.to_string()],
                 size: blob_hash.len() as u64,
                 hlc,
                 author_pubkey: self.name.to_string(),
@@ -59,12 +59,12 @@ fn three_agents_converge_after_gossiping_pairwise() {
 
     for agent in [&alice, &bob, &carol] {
         assert_eq!(
-            agent.manifest.get("notes/a.md").unwrap().blob_hash,
-            "hash-a2",
+            agent.manifest.get("notes/a.md").unwrap().chunk_hashes,
+            vec!["hash-a2"],
             "{} should see Carol's later write win",
             agent.name
         );
-        assert_eq!(agent.manifest.get("notes/b.md").unwrap().blob_hash, "hash-b1");
+        assert_eq!(agent.manifest.get("notes/b.md").unwrap().chunk_hashes, vec!["hash-b1"]);
         assert_eq!(agent.manifest.len(), 2, "{} manifest size", agent.name);
     }
 }
@@ -86,8 +86,8 @@ fn concurrent_writes_to_the_same_path_are_both_preserved_after_gossip() {
     // agree on which is which.
     assert_eq!(alice.manifest.len(), 2);
     assert_eq!(bob.manifest.len(), 2);
-    let alice_winner = alice.manifest.get("shared.txt").unwrap().blob_hash.clone();
-    let bob_winner = bob.manifest.get("shared.txt").unwrap().blob_hash.clone();
+    let alice_winner = alice.manifest.get("shared.txt").unwrap().chunk_hashes.clone();
+    let bob_winner = bob.manifest.get("shared.txt").unwrap().chunk_hashes.clone();
     assert_eq!(alice_winner, bob_winner, "both replicas must pick the same winner");
 }
 

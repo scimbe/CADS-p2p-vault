@@ -9,30 +9,48 @@ Agent-Fabric channels (Noise_IK, the same primitive `ct-agent channel` uses toda
 
 | Concern | Existing systems | What we take from them |
 |---|---|---|
-| Conflict-free multi-writer data | Automerge, Yjs, diamond-types | CRDT merge semantics for the **manifest** (path → content-hash), not for file bytes themselves — files are immutable content-addressed blobs, only the manifest is a CRDT. Avoids OT/CRDT complexity on large binary content. |
+| Conflict-free multi-writer data | Automerge, Yjs, diamond-types | Deliberately **not** used for file content: real-world reports put full-document-CRDT metadata at 2-3x the data size, with Automerge specifically costing 40-60% overhead vs. raw text and tombstones accumulating into the tens of thousands on heavily-edited documents ([tonsky.me](https://tonsky.me/blog/crdt-filesync/), [Zylos Research](https://zylos.ai/research/2026-01-29-crdt-real-time-collaboration/)). We only apply CRDT semantics to the **manifest** (path → chunk-list), a much smaller state space — file bytes themselves are immutable content-addressed chunks, never CRDT-merged. |
 | Gossip-based convergence & membership | Scuttlebutt (SSB), SWIM, HyParView/Plumtree | SSB is the closest prior art: signed, append-only per-peer logs, gossiped pairwise, fully offline-capable, no central server required for data — only for peer discovery ("pubs"). We mirror that split exactly: core = SSB "pub" (discovery only), agents = SSB "feeds." SWIM-style heartbeats for failure detection driving provider failover. |
-| P2P file sync w/ a coordination-only server | **Syncthing** (introducer/relay/discovery server never touches file bytes when direct P2P is possible), BitTorrent+DHT, Resilio Sync | Directly validates the requested shape: a lightweight rendezvous service + direct device-to-device block exchange. We adopt Syncthing's block-exchange-with-content-hash model for the data plane. |
-| Content-addressed storage + Merkle history | Git, IPFS/libp2p, Hypercore (Dat/Holepunch) | Blobs keyed by BLAKE3 hash; a file's history is a hash-linked chain, same shape as git objects / Hypercore feeds. |
+| P2P file sync w/ a coordination-only server | **Syncthing** (introducer/relay/discovery server never touches file bytes when direct P2P is possible), BitTorrent+DHT, Resilio Sync | Directly validates the requested shape: a lightweight rendezvous service + direct device-to-device block exchange. Confirmed: **Syncthing does not use CRDTs either** — on a true conflict it just keeps both files as `sync-conflict` copies rather than merging ([Syncthing docs](https://docs.syncthing.net/users/syncing.html)); we adopt that same conflict-copy fallback for the manifest's genuinely-concurrent case (§2), but add a deterministic CRDT merge rule on top so *every* replica converges to the same choice without Syncthing's ad hoc "which neighbor has the latest state" heuristic. |
+| Chunking large files for efficient sync/dedup | Fixed-size blocks vs. **content-defined chunking** (rsync rolling checksum, FastCDC, restic/Borg/Perkeep) | Fixed-size chunking has the "boundary-shift" problem: one inserted byte near the start invalidates every following block. Content-defined chunking (CDC) places boundaries based on a rolling hash of the content itself, so an edit only perturbs the chunks around it. FastCDC is the current widely-adopted approach, using dual-mask boundary normalization for a tighter chunk-size distribution ([USENIX ATC '16](https://www.usenix.org/system/files/conference/atc16/atc16-paper-xia.pdf)). We use a single-mask **buzhash** variant (§2) — simpler, keeps CDC's essential resync property, dual-mask normalization is a possible follow-up, not a correctness requirement. |
+| Content-addressed storage + Merkle history | Git, IPFS/libp2p, Hypercore (Dat/Holepunch) | Chunks keyed by BLAKE3 hash; a file is an ordered chunk-hash list (a flat Merkle list), same shape as git's own content-addressing, generalized the way IPFS/Hypercore chunk large objects. |
 | NAT traversal without a known public address | WebRTC ICE/STUN/TURN, libp2p AutoNAT + DCUtR + relay/hole-punch | Not reinvented — **CADS-Tunnel's own Agent-Fabric channel broker/relay already solves this** (agents dial the broker, get relayed or upgraded to direct). The vault reuses that channel transport as-is. |
 | Leaderless failover / lease election | Raft leader election (too heavyweight — needs a coordinator), Bully algorithm, SWIM-style suspicion | We use a **CRDT lease record** (see §4) instead of a consensus protocol — converges the same way the manifest does, no separate election protocol to implement. |
 
 **Conclusion driving the design:** nothing here is genuinely novel — it's Scuttlebutt's
 gossip/offline-first model + Syncthing's coordination-server-that-never-touches-bytes
-shape + git/Hypercore's content-addressing, wired through CADS-Tunnel's *existing*
+shape + FastCDC-style content-defined chunking (not whole-file hashing — see §2) +
+git/Hypercore's content-addressing, wired through CADS-Tunnel's *existing*
 Agent-Fabric channel transport (so the core extension needed is small — see §5).
 
 ## 2. Data model
 
-- **Blob**: immutable bytes, addressed by `blake3(content)`. Encrypted at rest with
-  the vault's symmetric content key (§6) before being written to any agent's local
-  disk — an agent storing a blob it doesn't otherwise have permission to read still
-  cannot read it.
-- **Manifest entry**: `{path, blob_hash, size, mtime, hlc_timestamp, author_pubkey,
-  tombstone: bool}`. The manifest is an **OR-Set CRDT** keyed by `path`, using a
-  Hybrid Logical Clock (HLC) for last-writer-wins per path *and* keeping both sides
-  as `path.conflict-<author_short>` when two writes to the same path are truly
-  concurrent (unordered by HLC) — same conflict-preserving behavior as Syncthing,
-  never silently drops data.
+- **Chunk**: an immutable, content-defined slice of a file's bytes, addressed by
+  `blake3(chunk_bytes)`. Boundaries are placed by a **buzhash** rolling hash (a true
+  bounded sliding-window hash: XOR + rotate, so a byte's contribution is exactly
+  cancelled out once it's `WINDOW` bytes in the past) rather than at fixed offsets —
+  editing part of a large file only changes the chunks around the edit, so peers only
+  need to transfer/store those chunks (implemented in `crates/vault-manifest/src/chunk.rs`,
+  verified by tests: same content anywhere dedups to the same chunk hash, and a small
+  edit near the start of a 300KB file leaves >70% of chunk hashes unchanged).
+  **Implementation note, kept here deliberately as a warning:** the first version
+  of this used an *add*-based "Gear hash" (`hash = (hash << 1) + table[byte]`),
+  which looks equivalent to buzhash but isn't — `wrapping_add`'s carries propagate
+  upward with no fixed lifetime, so it does *not* cleanly forget old bytes the way
+  XOR-based cancellation does, and it silently failed the resync/dedup tests. It
+  was caught only because the tests used realistic (pseudo-random) data instead of
+  uniform/periodic bytes — degenerate test input mostly exercises the
+  `MAX_CHUNK_SIZE` forced-cut fallback and would have hidden the bug either way.
+  Chunks are encrypted at rest with the vault's symmetric content key (§6) before
+  being written to any agent's local disk — an agent storing a chunk it doesn't
+  otherwise have permission to read still cannot read it.
+- **Manifest entry**: `{path, chunk_hashes: [String], size, hlc_timestamp,
+  author_pubkey, tombstone: bool}` — a file's content is the ordered concatenation
+  of its chunks, not a single whole-file hash. The manifest is an **OR-Set CRDT**
+  keyed by `path`, using a Hybrid Logical Clock (HLC) for last-writer-wins per path
+  *and* keeping both sides as `path.conflict-<author_short>` when two writes to the
+  same path are truly concurrent (unordered by HLC) — same conflict-preserving
+  behavior as Syncthing, never silently drops data.
 - **Vault log**: each agent keeps its own append-only, self-signed log of manifest
   operations (create/update/delete) — an SSB-style feed. Peers gossip **deltas**
   (missing log entries), not full state, once initial sync completes.
