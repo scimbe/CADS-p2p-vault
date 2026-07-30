@@ -152,3 +152,14 @@ build are a follow-up cycle.
 This is a multi-cycle build (explicitly acknowledged — this is not a
 single-session deliverable). Progress tracked in this repo's issues; core-facing
 asks tracked on `scimbe/CADS-Tunnel`.
+
+**§7 step 1 (local single-host simulation) is done and running for real**, not
+just unit-tested: `crates/vault-agent` is a real binary, verified with 3 local
+processes converging on creates/edits/deletes (including edits/deletes made
+by an agent other than the original author) and settling to a stable,
+error-free fixed point. See `docs/TESTPLAN.md` cycle 3 for the three real bugs
+found and fixed along the way. Remaining: §7 step 2 (swap the current
+plain-TCP gossip transport for real CADS-Tunnel Agent-Fabric channels — no
+redesign needed, `vault-agent`'s gossip logic is already transport-agnostic
+at the module boundary), manifest persistence across restarts, and §8
+(Android client, not started).

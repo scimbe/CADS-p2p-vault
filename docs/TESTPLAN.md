@@ -45,3 +45,76 @@ See ARCHITECTURE.md §7. Log of runs goes here as cycles progress.
   otherwise-different 50KB-shared-block files, and >70% chunk-hash survival
   after a 3-byte insertion near the start of a 300KB pseudo-random file.
 - Updated ARCHITECTURE.md §1/§2 with citations and the corrected data model.
+
+## 2026-07-30 — cycle 3 (`vault-agent` built and run for real — ARCHITECTURE.md §7 step 1)
+
+Operator asked for the demo to actually be up and running, not just
+unit-tested. Built `crates/vault-agent`, a real binary: scans a directory
+into chunks + the CRDT manifest, gossips full manifest state + on-demand
+chunk fetch with configured peers over plain TCP each tick (line-delimited
+JSON — real CADS-Tunnel channel transport is still a follow-up, §7 step 2),
+and materializes remote entries (write or delete) to disk. Ran 3 instances
+(alice/bob/carol) as real local processes with separate directories/ports and
+put real traffic through them. **17/17 `vault-manifest` unit/simulation
+tests still pass**, plus the live run below.
+
+Three real bugs found by running actual multi-agent traffic — none of them
+would have been caught by the in-process simulation alone, because that
+simulation only ever exercised each agent's *own* authored writes, never a
+disk that lags behind or disagrees with the manifest:
+
+1. **Spurious conflict from materializing your own peer's file.** First
+   version compared a locally-scanned file against the manifest entry only
+   if `existing.author_pubkey == self_id` before treating it as "unchanged."
+   The moment an agent materialized a peer's file to disk, its own next scan
+   saw *a file whose manifest entry it didn't author* and re-authored it
+   under its own id with a fresh HLC — and when two agents did this in the
+   same tick, it manufactured a byte-identical "conflict copy" purely from
+   local disk churn. Fixed by comparing content only, regardless of author.
+
+2. **Deletes only worked for the original author.** The "did a file vanish
+   locally" check only considered entries this agent itself had authored, so
+   a *different* agent deleting a file it didn't create did nothing — no
+   tombstone, no propagation — violating the "all agents can CRUD any file"
+   requirement. Fixed by tracking `known_local`: whatever this agent last
+   confirmed was correctly reflected on its own disk, whether self-authored
+   or applied from a peer, and tombstoning any of those paths that
+   disappear.
+
+3. **Deletes (and remote edits) got silently reverted by the original
+   holder.** Even after fix (2), a tombstone or edit from another agent kept
+   getting undone: the *original* holder's own scan compared its local disk
+   against the manifest's current (now-tombstoned/edited) entry using
+   `Manifest::get()`, which hides tombstones — so the holder's own untouched,
+   still-present file looked "new" the instant it learned of someone else's
+   delete or edit, and got re-authored with a fresh (always-winning) HLC.
+   The real fix wasn't `get()` vs. a tombstone-aware `get_any()` (added to
+   `vault-manifest` with a regression test) — it was recognizing that a local
+   scan must only ever compare against `known_local` (what *this* agent last
+   confirmed matches), never against the manifest's global state, which may
+   simply be ahead of this replica's own materialize step.
+
+Verified live, with 3 real local processes on 1-second ticks:
+
+- Create on alice → converges (byte-identical) on bob and carol.
+- Edit by **carol** to a file **alice** created → converges everywhere,
+  including back onto alice's own disk, and stays stable over repeated
+  ticks (no flapping).
+- Delete by **bob** of a file **alice** created → file disappears on alice,
+  bob, and carol, and stays gone (no resurrection).
+- Two agents (alice, carol) writing to the same new path within the same
+  second → all three replicas converge to the identical winning content (no
+  split-brain); triggering the exact-HLC-tie conflict-copy path deterministically
+  in a live run needs finer-grained clock control than shell timing gives —
+  that path is already covered by `vault-manifest`'s own unit tests.
+- 8s idle settle period after all of the above: zero errors, zero further
+  changes in any log — confirms the system reaches a quiescent fixed point
+  rather than oscillating.
+
+**Known limitations, deliberately deferred, not silently dropped:**
+manifest state is in-memory only and does not survive an agent restart yet
+(a restarted agent starts empty and re-derives only its own local files,
+temporarily "orphaning" its authorship of anything a peer gave it until the
+next gossip round refills it); transport is plain TCP, not yet the real
+CADS-Tunnel Agent-Fabric channel (§7 step 2); the Android client is still
+unstarted (§8).

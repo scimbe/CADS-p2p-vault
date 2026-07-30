@@ -52,12 +52,26 @@ impl Manifest {
         self.entries.get(path).filter(|e| !e.tombstone)
     }
 
+    /// Like `get`, but also returns tombstoned entries. Callers that decide
+    /// whether to (re-)author a path from local disk state need this: a file
+    /// physically present locally but tombstoned by another agent must NOT
+    /// be resurrected just because `get` hides the tombstone from them.
+    pub fn get_any(&self, path: &str) -> Option<&Entry> {
+        self.entries.get(path)
+    }
+
     pub fn len(&self) -> usize {
         self.entries.values().filter(|e| !e.tombstone).count()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Iterate all entries (including tombstones) — callers that materialize
+    /// files onto disk need to see tombstones too, unlike `get`.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Entry)> {
+        self.entries.iter()
     }
 
     /// Merge a remote manifest into this one. Deterministic: every replica that
@@ -112,6 +126,27 @@ mod tests {
             author_pubkey: author.to_string(),
             tombstone: false,
         }
+    }
+
+    #[test]
+    fn get_hides_tombstones_but_get_any_still_sees_them() {
+        // Regression test for a real bug found running vault-agent locally:
+        // an agent that still physically has a file another agent deleted
+        // used `get()` (which hides tombstones) to decide whether to
+        // re-author it, so it always looked "missing" and got resurrected
+        // with a fresh HLC that clobbered the delete.
+        let mut m = Manifest::new();
+        let mut e = entry("h1", Hlc { physical_ms: 1, logical: 0 }, "alice");
+        m.put("a.txt", e.clone());
+        e.tombstone = true;
+        e.hlc = Hlc { physical_ms: 2, logical: 0 };
+        m.put("a.txt", e);
+
+        assert!(m.get("a.txt").is_none(), "get() must hide a tombstoned entry");
+        assert!(
+            m.get_any("a.txt").is_some_and(|e| e.tombstone),
+            "get_any() must still expose it so a stale local file isn't resurrected"
+        );
     }
 
     #[test]
