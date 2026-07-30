@@ -118,3 +118,86 @@ temporarily "orphaning" its authorship of anything a peer gave it until the
 next gossip round refills it); transport is plain TCP, not yet the real
 CADS-Tunnel Agent-Fabric channel (§7 step 2); the Android client is still
 unstarted (§8).
+
+## 2026-07-30 — cycle 4 (real channel transport — ARCHITECTURE.md §7 step 2)
+
+Operator asked to wire `vault-agent` to real CADS-Tunnel Agent-Fabric
+channels. Investigated the exact `ct-agent channel` accept/initiate env-var
+protocol by reading the already-working crew-bridge code (`serve-role.sh`,
+`server.lib.js`, `compose.flappy-demo.yml`) rather than guessing, so this
+reuses the same mechanism the flappy/cookbook demos already depend on — no
+new core capability needed, matching the "small ask to core, reuse
+everything else" plan in ARCHITECTURE.md §3.
+
+A real channel call is a fresh, stateless subprocess dial per message (unlike
+the old persistent TCP stream), which forced two real design changes, not
+just a new transport option:
+
+1. **Wire format**: replaced the order-dependent `ManifestMsg` →
+   `GetChunksMsg` → `ChunksMsg` sequence with self-describing tagged enums
+   (`GossipRequest`/`GossipResponse`, `crates/vault-agent/src/wire.rs`) — a
+   one-shot handler invocation has no "which step" context, so every message
+   now carries its own type tag.
+2. **Manifest persistence**: the long-lived `vault-agent` process and the
+   new short-lived `gossip-handler` binary (invoked fresh per incoming call
+   by `ct-agent channel accept`) are separate OS processes with no shared
+   memory, so the manifest now persists to `.vault/manifest.json` (atomic
+   write-via-temp-then-rename) as the only channel between them. This also
+   incidentally closes half of the "manifest does not survive a restart"
+   limitation from cycle 3 — `vault-agent` now loads the on-disk manifest at
+   startup instead of an empty one (needed anyway, so a restart does not
+   clobber whatever `gossip-handler` wrote while it was down). `known_local`
+   (per-agent local-authorship bookkeeping) still starts empty on restart —
+   deliberately not also fixed here, to keep this change scoped; a restarted
+   agent may still spuriously re-author its own already-synced files under a
+   fresh HLC on its first post-restart scan.
+
+`main.rs` gained a new `gossip_once_cmd` path alongside the existing,
+already-proven `gossip_once_tcp`: spawns `sh -c <peer's dial command>`
+per message, with a manual poll-based timeout (`Child` has no native one),
+mirroring the crew bridge's own `runCmd`. Peers are now given as full dial
+command strings via repeatable `--peer-cmd`, distinct from the TCP `--peers`
+list; a run can mix both. `--listen` is now optional — channel-only mode
+needs no in-process TCP listener, since the accept side is an external
+`ct-agent channel accept` process.
+
+**Regression check**: re-ran the exact 3-agent (alice/bob/carol) local TCP
+convergence test from cycle 3 after the rewrite — create/edit/delete all
+still converge correctly, byte-identical, zero errors. The wire-format
+rewrite did not regress the already-proven transport.
+
+**New, channel-shaped path proven end-to-end** (without real channels, which
+are still blocked on credentials — see below): ran two full `vault-agent`
+processes (dave/erin), each with `--peer-cmd` pointed directly at the
+other's `gossip-handler --dir <their-vault>` — i.e. the exact request/
+response subprocess shape a real `ct-agent channel initiate` dial would
+produce, minus the channel plumbing itself. A file created on erin appeared
+byte-identical on dave, and vice versa, both directions, no errors — proving
+the new wire format + disk-persistence + subprocess-dial design is sound.
+
+Added `scripts/serve-vault-gossip.sh` (mirrors `serve-role.sh` exactly),
+`scripts/vault-gossip-handler.sh` (the `CT_AGENT_SERVICE_HANDLER_CMD` target,
+since `gossip-handler` itself needs a `--dir` argument ct-agent has no way to
+pass), and `scripts/provision-vault-gossip-channel.sh` (thin wrapper around
+CADS-Tunnel's own self-service `provision-link-channel.sh`, fixed to
+`SERVICE=vault_gossip` semantics). All three ship a `--selftest` mode
+(no network calls) — all three pass, once `CT_AGENT` points at a real
+`ct-agent` binary (not on `PATH` on this maintenance host by default, but
+present at `.demo-checkouts/bin/ct-agent`).
+
+One real bug found and fixed while writing these: a `${VAR:?message}`
+default-value message containing an apostrophe (e.g. "CADS-Tunnel's own")
+corrupted bash's own quote-tracking for that parameter-expansion construct —
+even though the whole thing was inside double quotes — silently swallowing
+everything from that line to the next stray matching quote later in the
+file as dead text, with no syntax error (`bash -n` passes) and no visible
+symptom beyond "unbound variable" errors referencing lines nowhere near the
+real cause. Fixed by rewording all `:?`/`:-` default messages to avoid
+apostrophes; confirmed via `bash -n` plus each script's `--selftest`.
+
+**Still genuinely blocked**: provisioning the real `vault_gossip` channel for
+the two-host test needs a live OIDC bearer token (Keycloak username/password)
+and an operator keypair (`ct-agent channel operator-init`) — neither exists
+anywhere in this environment (confirmed by grepping `shared.env`'s variable
+names). This is architecturally self-service, not a core-admin restriction,
+but is a real credential gap only the operator can close.

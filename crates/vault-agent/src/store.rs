@@ -17,6 +17,7 @@ use vault_manifest::manifest::{Entry, Manifest};
 
 pub struct Store {
     pub root: PathBuf,
+    pub vault_dir: PathBuf,
     pub chunks_dir: PathBuf,
 }
 
@@ -26,7 +27,35 @@ impl Store {
         let chunks_dir = vault_dir.join("chunks");
         fs::create_dir_all(&root)?;
         fs::create_dir_all(&chunks_dir)?;
-        Ok(Store { root, chunks_dir })
+        Ok(Store { root, vault_dir, chunks_dir })
+    }
+
+    fn manifest_path(&self) -> PathBuf {
+        self.vault_dir.join("manifest.json")
+    }
+
+    /// Load the on-disk manifest snapshot (empty if none exists yet). This is
+    /// the only channel through which the long-lived agent process and the
+    /// short-lived `gossip-handler` invocations (spawned fresh per incoming
+    /// call by `ct-agent channel accept` — see bin/gossip_handler.rs) share
+    /// state; they are separate OS processes, not threads.
+    pub fn load_manifest(&self) -> io::Result<Manifest> {
+        match fs::read(self.manifest_path()) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Manifest::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Persist the manifest atomically (write-to-temp + rename) so a
+    /// concurrently-spawned `gossip-handler` process never observes a
+    /// partially-written file.
+    pub fn save_manifest(&self, manifest: &Manifest) -> io::Result<()> {
+        let path = self.manifest_path();
+        let tmp = self.vault_dir.join("manifest.json.tmp");
+        let bytes = serde_json::to_vec(manifest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        fs::write(&tmp, bytes)?;
+        fs::rename(&tmp, &path)
     }
 
     fn chunk_path(&self, hash_hex: &str) -> PathBuf {

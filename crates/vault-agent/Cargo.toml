@@ -3,9 +3,17 @@ name = "vault-agent"
 version = "0.0.0"
 edition = "2021"
 
+[lib]
+name = "vault_agent"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vault-agent"
 path = "src/main.rs"
+
+[[bin]]
+name = "gossip-handler"
+path = "src/bin/gossip_handler.rs"
 
 [dependencies]
 vault-manifest = { path = "../vault-manifest" }

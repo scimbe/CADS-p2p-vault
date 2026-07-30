@@ -5,13 +5,18 @@ CADS-Tunnel-connected agents. Core coordinates discovery only — it never
 transfers or sees file content. See [ARCHITECTURE.md](ARCHITECTURE.md) for the
 full design, prior-art survey, and test plan.
 
-**Status: running locally.** `vault-agent` is a real binary that gossips full
-manifest state + on-demand chunk bytes over plain TCP and materializes files
-to disk — verified with 3 local instances converging on creates, edits,
-deletes, and near-concurrent writes (see `docs/TESTPLAN.md`, cycle 3). Not
-yet wired to real CADS-Tunnel Agent-Fabric channels (still plain TCP — see
-ARCHITECTURE.md §7 step 2) and manifest state does not persist across a
-restart yet.
+**Status: running locally, channel transport wired.** `vault-agent` gossips
+full manifest state + on-demand chunk bytes each tick over either plain TCP
+or a real CADS-Tunnel Agent-Fabric channel dial (ARCHITECTURE.md §7 step 2),
+and materializes files to disk. Manifest state now persists to
+`.vault/manifest.json` (atomic write) so it survives an agent restart and can
+be shared with the separate `gossip-handler` process. Verified: the 3-local-
+instance TCP convergence test (creates/edits/deletes, cycle 3) still passes
+after the wire-format rewrite, and a 2-agent run through `gossip-handler`
+subprocess calls (the same request/response shape a real `ct-agent channel`
+dial uses) converges files in both directions (cycle 4). Still blocked on
+real channels specifically: provisioning a `vault_gossip` channel needs OIDC
++ operator credentials this checkout does not hold — see `docs/TESTPLAN.md`.
 
 ## Layout
 
@@ -19,10 +24,19 @@ restart yet.
   logic, transport-agnostic.
 - `crates/vault-agent` — the running agent binary: scans a local directory
   into content-defined chunks + the CRDT manifest, gossips with configured
-  peers over TCP (full manifest exchange + chunk fetch each tick), and
-  materializes remote entries (writes/deletes) back to disk. Transport is
-  plain TCP for now; swapping in real CADS-Tunnel Agent-Fabric channels is a
-  follow-up, not a redesign — see ARCHITECTURE.md §7 step 2.
+  peers (full manifest exchange + chunk fetch each tick) over TCP or a real
+  channel dial, and materializes remote entries (writes/deletes) back to
+  disk. Also builds `gossip-handler`, a single-shot binary invoked fresh per
+  incoming call by a `ct-agent channel accept` process on the serve side (see
+  `scripts/serve-vault-gossip.sh`) — the two binaries share manifest state
+  through `.vault/manifest.json` on disk, since they are separate OS
+  processes.
+- `scripts/` — `serve-vault-gossip.sh` (accept-side wrapper, mirrors the
+  existing crew `serve-role.sh`), `vault-gossip-handler.sh` (the handler
+  script `ct-agent` invokes), and `provision-vault-gossip-channel.sh`
+  (self-service channel provisioning for the two-host test, delegates to
+  CADS-Tunnel's `provision-link-channel.sh`). All three have a `--selftest`
+  mode that checks plumbing with no network calls.
 - `android/` — Android client scaffolding (Kotlin/Compose), shares the Rust
   manifest core via JNI bindings once built. Not started (no Android SDK on
   this host yet).
@@ -42,3 +56,27 @@ Any agent may create, edit, or delete any file — deletes and edits from a
 non-author correctly propagate (see the two real bugs documented inline in
 `crates/vault-agent/src/store.rs` and in the test-plan log, both found by
 running actual multi-agent local traffic, not by inspection).
+
+## Running it over a real CADS-Tunnel channel (two hosts)
+
+Each host runs `vault-agent` with no `--listen`/`--peers` (the accept side is
+an external process, not vault-agent itself) and one `--peer-cmd` per remote
+peer — a full `ct-agent channel initiate ...` dial command string, the same
+shape the crew demos already use for `CREW_PHYSICS_CMD` etc:
+
+```
+./target/release/vault-agent --id alice --dir ./alice-vault \
+  --peer-cmd 'env CT_CHANNEL_ROLE=initiate CT_CHANNEL_CALL_SERVICE=vault_gossip \
+    CT_CHANNEL_BROKER=$CT_AGENT_EDGE_BROKER CT_CHANNEL_RELAY=$CT_AGENT_EDGE_RELAY \
+    CT_CHANNEL_LISTEN=0.0.0.0:0 CT_CHANNEL_GRANT=$ALICE_INITIATE_GRANT \
+    CT_CHANNEL_HOLDER_KEY=$ALICE_HOLDER_KEY CT_CHANNEL_NOISE_KEY=$ALICE_NOISE_KEY \
+    ct-agent channel'
+```
+
+And each host also runs `scripts/serve-vault-gossip.sh` so its peer can dial
+*it* back (bidirectional gossip needs both sides serving and dialing).
+`scripts/provision-vault-gossip-channel.sh` provisions the pairwise channel +
+prints the exact `--peer-cmd` / `serve-vault-gossip.sh` invocations for both
+sides — see that script's usage comment. Provisioning is self-service (any
+OIDC-authenticated user can register their own channels) but needs a live
+OIDC login + operator keypair this checkout does not currently hold.
