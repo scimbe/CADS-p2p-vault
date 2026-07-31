@@ -267,3 +267,38 @@ means creating a new account in the **production** `ct-demo` realm backing
 bunsenbrenner.org, which also auto-provisions a Standard-tier tunnel per the
 platform's own onboarding design. Flagged to the operator as a real decision
 rather than done unilaterally.
+
+## 2026-07-31 — cycle 6 (non-root container hardening, while still blocked on cycle 5's credential decision)
+
+Closed the test-harness gap cycle 5 deliberately deferred rather than leaving
+it flagged-but-untouched: `Dockerfile` now builds a `vault` user from two new
+build args, `VAULT_UID`/`VAULT_GID` (default `1000`, matching common single-
+user-host convention), `USER vault` before `ENTRYPOINT`, `docker-compose.test.yml`
+passes them through from `HOST_UID`/`HOST_GID` shell env vars so a build run
+as `HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose ... up --build`
+produces host-owned, not root-owned, materialized files.
+
+Re-ran the full cycle-5 scenario set against the rebuilt image, this time
+using plain host-side redirects throughout instead of cycle 5's `docker exec`
+workaround (no longer needed):
+
+- Create on alice (`echo ... > test-run/alice/greeting.txt`, no `docker exec`)
+  → converges byte-identical to bob and carol; the file's owner on all three
+  bind mounts is the invoking host user (`becke:docker`, uid 1001 in this
+  run), confirmed via `stat`, not root.
+- Edit by **carol** (non-author, plain host redirect) → converges to alice
+  and bob.
+- Delete by **bob** (non-author, plain `rm`) → propagates to alice and carol,
+  stays gone.
+- Container logs: zero errors/panics; 8s idle-settle window shows zero further
+  log lines — same quiescent-fixed-point bar prior cycles set.
+
+No regressions from the non-root change, no new bugs. `README.md` updated to
+drop the `docker exec`/`docker run --rm ... rm -rf` workaround instructions
+and document `HOST_UID`/`HOST_GID`. Cycle 5's original root-cause note above
+is left as-is (historical record of what was true then); this entry is the
+fix.
+
+**Still genuinely blocked**: same OIDC bearer token + operator keypair gap as
+cycles 4-5 — this cycle deliberately picked a task that didn't need it, not a
+resolution of it.

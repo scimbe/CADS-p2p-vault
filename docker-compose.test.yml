@@ -1,19 +1,37 @@
 # 3-container TCP-gossip convergence test, real Docker network (not same-host
 # processes on loopback) — build/up, drop files into ./test-run/{alice,bob,carol}
 # on the host, watch them converge across all three.
+#
+# Runs as a non-root, host-matching user by default (HOST_UID/HOST_GID, see
+# Dockerfile) so materialized files in ./test-run/* stay host-editable instead
+# of root-owned. `docker compose` does not read `id -u` itself, so export
+# these first: `HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose -f
+# docker-compose.test.yml up -d --build`. Left unset, both default to 1000.
 services:
   alice:
-    build: .
+    build:
+      context: .
+      args:
+        VAULT_UID: "${HOST_UID:-1000}"
+        VAULT_GID: "${HOST_GID:-1000}"
     volumes: ["./test-run/alice:/vault"]
     command: ["--id", "alice", "--dir", "/vault", "--listen", "0.0.0.0:9401",
               "--peers", "bob:9401,carol:9401", "--tick-ms", "1000"]
   bob:
-    build: .
+    build:
+      context: .
+      args:
+        VAULT_UID: "${HOST_UID:-1000}"
+        VAULT_GID: "${HOST_GID:-1000}"
     volumes: ["./test-run/bob:/vault"]
     command: ["--id", "bob", "--dir", "/vault", "--listen", "0.0.0.0:9401",
               "--peers", "alice:9401,carol:9401", "--tick-ms", "1000"]
   carol:
-    build: .
+    build:
+      context: .
+      args:
+        VAULT_UID: "${HOST_UID:-1000}"
+        VAULT_GID: "${HOST_GID:-1000}"
     volumes: ["./test-run/carol:/vault"]
     command: ["--id", "carol", "--dir", "/vault", "--listen", "0.0.0.0:9401",
               "--peers", "alice:9401,bob:9401", "--tick-ms", "1000"]

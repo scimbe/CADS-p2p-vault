@@ -63,7 +63,7 @@ running actual multi-agent local traffic, not by inspection).
 
 ```
 mkdir -p test-run/alice test-run/bob test-run/carol
-docker compose -f docker-compose.test.yml up -d --build
+HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose -f docker-compose.test.yml up -d --build
 echo hello > test-run/alice/greeting.txt   # then watch it appear in bob/carol
 docker compose -f docker-compose.test.yml down
 ```
@@ -71,10 +71,10 @@ docker compose -f docker-compose.test.yml down
 Three genuinely separate containers on a real Docker bridge network, peers
 addressed by Docker's own service-name DNS (`bob:9401`, not `127.0.0.1:...`)
 — see `docs/TESTPLAN.md` cycle 5 for what this catches that same-host
-processes can't. `vault-agent` runs as root in the container (no `USER` line
-yet), so materialized files in `test-run/*` end up root-owned on the host;
-edit through `docker exec <container> sh -c '...'` rather than a host-side
-redirect, or clean up with `docker run --rm -v "$PWD/test-run":/c debian:bookworm-slim rm -rf /c`.
+processes can't. `vault-agent` runs as a non-root user built with the host's
+own `HOST_UID`/`HOST_GID` (cycle 6), so materialized files in `test-run/*`
+stay host-editable with a plain redirect — no `docker exec` workaround
+needed. Leaving `HOST_UID`/`HOST_GID` unset defaults both to `1000`.
 
 ## Running it over a real CADS-Tunnel channel (two hosts)
 
