@@ -5,14 +5,16 @@ CADS-Tunnel-connected agents. Core coordinates discovery only — it never
 transfers or sees file content. See [ARCHITECTURE.md](ARCHITECTURE.md) for the
 full design, prior-art survey, and test plan.
 
-**Status: running locally, channel transport wired.** `vault-agent` gossips
-full manifest state + on-demand chunk bytes each tick over either plain TCP
-or a real CADS-Tunnel Agent-Fabric channel dial (ARCHITECTURE.md §7 step 2),
-and materializes files to disk. Manifest state now persists to
-`.vault/manifest.json` (atomic write) so it survives an agent restart and can
-be shared with the separate `gossip-handler` process. Verified: the 3-local-
-instance TCP convergence test (creates/edits/deletes, cycle 3) still passes
-after the wire-format rewrite, and a 2-agent run through `gossip-handler`
+**Status: running locally, in real Docker containers, channel transport
+wired.** `vault-agent` gossips full manifest state + on-demand chunk bytes
+each tick over either plain TCP or a real CADS-Tunnel Agent-Fabric channel
+dial (ARCHITECTURE.md §7 step 2), and materializes files to disk. Manifest
+state now persists to `.vault/manifest.json` (atomic write) so it survives
+an agent restart and can be shared with the separate `gossip-handler`
+process. Verified: the 3-instance TCP convergence test (creates/edits/deletes)
+now passes across three genuinely separate Docker containers on a real
+bridge network (`Dockerfile` + `docker-compose.test.yml`, cycle 5), not just
+same-host processes as in cycle 3, and a 2-agent run through `gossip-handler`
 subprocess calls (the same request/response shape a real `ct-agent channel`
 dial uses) converges files in both directions (cycle 4). Still blocked on
 real channels specifically: provisioning a `vault_gossip` channel needs OIDC
@@ -56,6 +58,23 @@ Any agent may create, edit, or delete any file — deletes and edits from a
 non-author correctly propagate (see the two real bugs documented inline in
 `crates/vault-agent/src/store.rs` and in the test-plan log, both found by
 running actual multi-agent local traffic, not by inspection).
+
+## Running it in Docker (three real containers)
+
+```
+mkdir -p test-run/alice test-run/bob test-run/carol
+docker compose -f docker-compose.test.yml up -d --build
+echo hello > test-run/alice/greeting.txt   # then watch it appear in bob/carol
+docker compose -f docker-compose.test.yml down
+```
+
+Three genuinely separate containers on a real Docker bridge network, peers
+addressed by Docker's own service-name DNS (`bob:9401`, not `127.0.0.1:...`)
+— see `docs/TESTPLAN.md` cycle 5 for what this catches that same-host
+processes can't. `vault-agent` runs as root in the container (no `USER` line
+yet), so materialized files in `test-run/*` end up root-owned on the host;
+edit through `docker exec <container> sh -c '...'` rather than a host-side
+redirect, or clean up with `docker run --rm -v "$PWD/test-run":/c debian:bookworm-slim rm -rf /c`.
 
 ## Running it over a real CADS-Tunnel channel (two hosts)
 

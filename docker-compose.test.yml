@@ -1,0 +1,19 @@
+# 3-container TCP-gossip convergence test, real Docker network (not same-host
+# processes on loopback) — build/up, drop files into ./test-run/{alice,bob,carol}
+# on the host, watch them converge across all three.
+services:
+  alice:
+    build: .
+    volumes: ["./test-run/alice:/vault"]
+    command: ["--id", "alice", "--dir", "/vault", "--listen", "0.0.0.0:9401",
+              "--peers", "bob:9401,carol:9401", "--tick-ms", "1000"]
+  bob:
+    build: .
+    volumes: ["./test-run/bob:/vault"]
+    command: ["--id", "bob", "--dir", "/vault", "--listen", "0.0.0.0:9401",
+              "--peers", "alice:9401,carol:9401", "--tick-ms", "1000"]
+  carol:
+    build: .
+    volumes: ["./test-run/carol:/vault"]
+    command: ["--id", "carol", "--dir", "/vault", "--listen", "0.0.0.0:9401",
+              "--peers", "alice:9401,bob:9401", "--tick-ms", "1000"]

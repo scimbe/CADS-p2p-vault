@@ -201,3 +201,69 @@ and an operator keypair (`ct-agent channel operator-init`) — neither exists
 anywhere in this environment (confirmed by grepping `shared.env`'s variable
 names). This is architecturally self-service, not a core-admin restriction,
 but is a real credential gap only the operator can close.
+
+## 2026-07-31 — cycle 5 (core maintainer: real Docker-container validation)
+
+Operator asked for the demo to be built and tested with real Docker
+containers specifically, not just bare host processes — a genuinely new bar,
+since every prior cycle's live testing ran `vault-agent` as plain processes
+on one host's loopback, which can't catch bugs that only show up under real
+network-namespace isolation (e.g. an accidental `127.0.0.1` hardcode, a
+`--listen` bind that only works when the peer is literally the same kernel
+network stack).
+
+Added `Dockerfile` (multi-stage: `rust:1-slim-bookworm` builder →
+`debian:bookworm-slim` runtime, matching the *same* Debian base in both
+stages deliberately — ct-agent's own `docker/Dockerfile` shipped with a real
+GLIBC-version mismatch bug from cross-stage base drift, found and fixed
+earlier this session; building from source with matching bases here avoids
+that class of bug entirely rather than needing the same fix later) and
+`docker-compose.test.yml` (three services, `alice`/`bob`/`carol`, each its
+own container + bind-mounted vault dir, `--peers` addressed by Docker's
+built-in service-name DNS instead of `127.0.0.1:<port>`).
+
+Built and ran all three containers for real. Re-verified every scenario
+cycle 3 proved on bare processes, this time across genuinely separate
+containers on a real Docker bridge network:
+
+- Create on alice → converges byte-identical to bob and carol.
+- Edit by **carol** (non-author) → converges everywhere, including back onto
+  alice's own container, stable over repeated ticks.
+- Delete by **bob** (non-author) → file disappears on all three, stays gone
+  after 3 further ticks (~6s), no resurrection.
+- Concurrent create on alice and carol to the same new path → all three
+  converge to the identical winning content, no split-brain, no spurious
+  conflict-copy file.
+- Container logs: only transient `Connection refused` lines during the very
+  first tick (peers not all listening yet — expected, self-heals same tick
+  cadence as bare-process mode), zero errors afterward, zero further changes
+  during an 8s idle-settle window — same quiescent-fixed-point bar cycle 3
+  set, now met under real container isolation too.
+
+No new bugs found — the wire-format/persistence work from cycle 4 and the
+three materialize-logic fixes from cycle 3 hold up unchanged under real
+network-namespace separation, not just loopback.
+
+One test-harness note, not a vault-agent bug: `vault-agent` runs as root
+inside the container (no `USER` directive — deliberately deferred, this is a
+test harness, not a hardening pass), so materialized files in the bind-mounted
+`test-run/*` directories end up root-owned on the host and can't be edited by
+a plain host-user redirect (`echo x > test-run/bob/f.txt` → `Permission
+denied`). Worked around by driving edits through `docker exec <container>
+sh -c '...'` instead, which is arguably more realistic anyway (an edit "from
+inside" the peer, not a host-level side channel) — noting this so a future
+non-root `USER` line in the Dockerfile is a deliberate follow-up, not a
+forgotten one.
+
+**Still genuinely blocked, same root cause as cycle 4**: the real two-container
+channel-transport test (the actual §7 step 2 milestone, `--peer-cmd` dialing
+real `ct-agent channel` instead of `--peers` TCP) needs the same OIDC bearer
+token + operator keypair cycle 4 was blocked on. Checked whether a lower-risk
+path exists — the realm has no pre-seeded test user and no service-account-
+enabled client (`ct-portal`'s `serviceAccountsEnabled`/`directAccessGrantsEnabled`
+are both `false`; only Keycloak's own built-in `admin-cli` supports the
+password grant `mint-oidc-token.sh` uses) — so genuinely closing this gap
+means creating a new account in the **production** `ct-demo` realm backing
+bunsenbrenner.org, which also auto-provisions a Standard-tier tunnel per the
+platform's own onboarding design. Flagged to the operator as a real decision
+rather than done unilaterally.
