@@ -291,7 +291,15 @@ pub fn materialize_remote(
         if !store.have_all_chunks(&entry) {
             continue; // wait for gossip to backfill the missing chunk bytes
         }
-        let mut bytes = Vec::with_capacity(entry.size as usize);
+        // NOT `Vec::with_capacity(entry.size as usize)`: `size` is a peer-supplied
+        // field on a gossiped `Entry`, never cross-checked against the entry's
+        // actual chunk content. An entry with `chunk_hashes: []` (so
+        // `have_all_chunks` above is vacuously true -- no real chunk data required
+        // at all) and `size: u64::MAX` would reach this line straight from a single
+        // gossip merge and crash the process on an immediate "capacity overflow"
+        // panic. `bytes` growing naturally instead is bounded by the real,
+        // already-validated chunk bytes actually read below.
+        let mut bytes = Vec::new();
         for hash in &entry.chunk_hashes {
             bytes.extend_from_slice(&store.read_chunk(hash)?);
         }
@@ -364,6 +372,37 @@ mod tests {
             io::ErrorKind::InvalidInput,
             "malformed hash is refused, not passed through to fs::read"
         );
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    #[test]
+    fn materialize_remote_does_not_crash_on_a_peer_supplied_absurd_size() {
+        // The exact attack this closes: a malicious/compromised gossip peer's
+        // manifest entry lies about `size` (a plain peer-supplied u64, never
+        // cross-checked against real chunk content) while listing NO chunk
+        // hashes at all, so `have_all_chunks` (vacuously true on an empty list)
+        // never blocks it waiting for real chunk bytes. A single such gossip
+        // merge must not crash this process.
+        let store = temp_store();
+        let manifest = Mutex::new(Manifest::new());
+        let known_local: KnownLocal = Mutex::new(HashMap::new());
+
+        let evil = Entry {
+            chunk_hashes: vec![],
+            size: u64::MAX,
+            hlc: Hlc { physical_ms: 1, logical: 0 },
+            author_pubkey: "mallory".to_string(),
+            tombstone: false,
+        };
+        manifest.lock().unwrap().put("innocuous.txt", evil);
+
+        let applied = materialize_remote(&store, &manifest, "self", &known_local)
+            .expect("a lied-about size must not error, let alone panic, the process");
+        assert_eq!(applied.len(), 1);
+
+        let written = fs::read(store.root.join("innocuous.txt")).unwrap();
+        assert!(written.is_empty(), "no real chunk bytes were ever supplied");
+
         let _ = fs::remove_dir_all(&store.root);
     }
 }
