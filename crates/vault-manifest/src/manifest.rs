@@ -34,6 +34,19 @@ impl Entry {
     }
 }
 
+/// Whether `path` is safe to later join onto a filesystem root without escaping it: not
+/// empty, not absolute, and no `..` (parent-directory) component anywhere in it. Pure and
+/// deliberately conservative -- a `.` (current-dir) component is also rejected, since no
+/// legitimate path this crate ever produces (`vault-agent`'s `rel_path`, a plain
+/// `strip_prefix` of a real directory walk) contains one.
+fn is_safe_relative_path(path: &str) -> bool {
+    use std::path::{Component, Path};
+    if path.is_empty() {
+        return false;
+    }
+    Path::new(path).components().all(|c| matches!(c, Component::Normal(_)))
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
     entries: HashMap<String, Entry>,
@@ -84,6 +97,21 @@ impl Manifest {
     }
 
     fn apply(&mut self, path: String, incoming: Entry) {
+        if !is_safe_relative_path(&path) {
+            // Manifest entries arrive over gossip from network peers (see `merge`) with
+            // `path` as an attacker-controlled string key. A consumer that materializes
+            // entries onto disk (`vault-agent`'s `materialize_remote`) joins `path` onto
+            // its vault root; without this check here — the single choke point every
+            // `put`/`merge` goes through — a malicious/compromised peer could set
+            // `path = "../../../etc/cron.d/x"` and have that consumer write (or, via a
+            // tombstone, delete) an arbitrary file outside the vault directory entirely.
+            eprintln!(
+                "vault-manifest: refusing entry with unsafe path {path:?} (must be a \
+                 relative path with no '..' component) -- a malicious peer cannot use \
+                 this to escape the vault directory"
+            );
+            return;
+        }
         match self.entries.get(&path) {
             None => {
                 self.entries.insert(path, incoming);
@@ -126,6 +154,49 @@ mod tests {
             author_pubkey: author.to_string(),
             tombstone: false,
         }
+    }
+
+    #[test]
+    fn is_safe_relative_path_rejects_traversal_and_absolute_paths() {
+        assert!(is_safe_relative_path("a.txt"));
+        assert!(is_safe_relative_path("dir/a.txt"));
+        assert!(is_safe_relative_path("dir/sub/a.txt"));
+        assert!(!is_safe_relative_path(""), "empty path");
+        assert!(!is_safe_relative_path("../etc/passwd"), "leading traversal");
+        assert!(!is_safe_relative_path("dir/../../etc/passwd"), "embedded traversal");
+        assert!(!is_safe_relative_path("a/../../b"), "traversal past the root");
+        assert!(!is_safe_relative_path("/etc/passwd"), "absolute path");
+        assert!(!is_safe_relative_path("./a.txt"), "current-dir component");
+    }
+
+    #[test]
+    fn a_gossiped_entry_with_a_traversal_path_is_refused_not_merged() {
+        // The exact attack this closes: a malicious/compromised gossip peer sets an
+        // entry's path to escape the vault root once a consumer (vault-agent's
+        // materialize_remote) joins it onto the local vault directory. The manifest
+        // must refuse to even hold such an entry -- proven here against the ONE
+        // choke point (`apply`, via both `put` and `merge`) every entry goes through.
+        let mut m = Manifest::new();
+        let evil = entry("h1", Hlc { physical_ms: 1, logical: 0 }, "mallory");
+        m.put("../../../etc/cron.d/evil", evil.clone());
+        assert!(m.is_empty(), "a traversal path must never be stored");
+        assert_eq!(m.get_any("../../../etc/cron.d/evil"), None);
+
+        // Same via merge (the actual gossip-ingest path).
+        let mut peer = Manifest::new();
+        peer.put("legit.txt", entry("h2", Hlc { physical_ms: 1, logical: 0 }, "mallory"));
+        // Bypass `put`'s own guard to construct an attacker manifest as it would
+        // arrive over the wire (a real peer controls its own serialized JSON, not
+        // our `put` API) -- merge must still refuse it on OUR side.
+        peer.entries.insert(
+            "../outside.txt".to_string(),
+            entry("h3", Hlc { physical_ms: 1, logical: 0 }, "mallory"),
+        );
+        let mut local = Manifest::new();
+        local.merge(&peer);
+        assert_eq!(local.len(), 1, "only the safe entry merges");
+        assert!(local.get("legit.txt").is_some());
+        assert_eq!(local.get_any("../outside.txt"), None, "the traversal entry never merges in");
     }
 
     #[test]

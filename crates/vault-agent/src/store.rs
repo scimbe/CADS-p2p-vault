@@ -58,16 +58,31 @@ impl Store {
         fs::rename(&tmp, &path)
     }
 
-    fn chunk_path(&self, hash_hex: &str) -> PathBuf {
-        self.chunks_dir.join(format!("{hash_hex}.bin"))
+    /// The on-disk path for chunk `hash_hex`, or `None` if `hash_hex` isn't a well-formed
+    /// BLAKE3 hex hash (64 ASCII hex digits, what `chunk::chunk()` always produces). The
+    /// single choke point every accessor below goes through: `hash_hex` reaches this crate
+    /// both from our own chunking (always well-formed) AND, unvalidated, straight off the
+    /// wire -- a `GossipResponse::Chunks` key a peer supplies (`main.rs::apply_chunks`) and
+    /// an `Entry::chunk_hashes` value in a gossiped manifest. Without this check, a
+    /// malicious/compromised peer could set `hash_hex` to something like
+    /// `"../../../etc/cron.d/x"` and have `write_chunk` write attacker-controlled bytes to
+    /// an arbitrary path outside the chunk store (or `read_chunk` read one back into the
+    /// synced vault, if a matching file happens to exist there).
+    fn chunk_path(&self, hash_hex: &str) -> Option<PathBuf> {
+        let len_ok = hash_hex.len() == 64;
+        let hex_ok = hash_hex.bytes().all(|b| b.is_ascii_hexdigit());
+        (len_ok && hex_ok).then(|| self.chunks_dir.join(format!("{hash_hex}.bin")))
     }
 
     pub fn has_chunk(&self, hash_hex: &str) -> bool {
-        self.chunk_path(hash_hex).is_file()
+        self.chunk_path(hash_hex).is_some_and(|p| p.is_file())
     }
 
     pub fn write_chunk(&self, hash_hex: &str, bytes: &[u8]) -> io::Result<()> {
-        let path = self.chunk_path(hash_hex);
+        let Some(path) = self.chunk_path(hash_hex) else {
+            eprintln!("vault-agent: refusing to write chunk with malformed hash {hash_hex:?}");
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "malformed chunk hash"));
+        };
         if path.is_file() {
             return Ok(()); // content-addressed: identical bytes already stored
         }
@@ -75,7 +90,10 @@ impl Store {
     }
 
     pub fn read_chunk(&self, hash_hex: &str) -> io::Result<Vec<u8>> {
-        fs::read(self.chunk_path(hash_hex))
+        let Some(path) = self.chunk_path(hash_hex) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "malformed chunk hash"));
+        };
+        fs::read(path)
     }
 
     /// True if we already hold every chunk an entry needs.
@@ -286,4 +304,66 @@ pub fn materialize_remote(
     }
 
     Ok(applied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_store() -> Store {
+        let dir = std::env::temp_dir().join(format!(
+            "vault-store-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        Store::open(dir).expect("open store")
+    }
+
+    #[test]
+    fn write_chunk_refuses_a_traversal_hash_instead_of_escaping_the_chunks_dir() {
+        // The exact attack this closes: `apply_chunks` (main.rs) writes chunk bytes
+        // using a hash straight off the wire -- a key in a peer's `GossipResponse::
+        // Chunks` map, entirely attacker-controlled. Without a shape check, a
+        // malicious/compromised peer could set that key to a traversal path and get
+        // arbitrary bytes written outside the chunk store (and outside the vault
+        // entirely). A well-formed hash is exactly 64 ASCII hex digits (what
+        // `chunk::chunk()`'s BLAKE3 `to_hex()` always produces) -- anything else is
+        // refused before any filesystem call.
+        let store = temp_store();
+        let err = store
+            .write_chunk("../../../etc/cron.d/evil", b"malicious content")
+            .expect_err("a traversal hash must be refused, not written");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            !store.root.parent().unwrap().join("etc").join("cron.d").join("evil").exists(),
+            "nothing was written outside the store"
+        );
+
+        // Same for a too-short/too-long or non-hex value -- any shape that isn't a
+        // real 64-hex-digit hash is refused, not silently accepted.
+        assert!(store.write_chunk("short", b"x").is_err());
+        assert!(store.write_chunk(&"a".repeat(63), b"x").is_err(), "63 chars, one short");
+        assert!(store.write_chunk(&"a".repeat(65), b"x").is_err(), "65 chars, one long");
+        assert!(store.write_chunk(&"g".repeat(64), b"x").is_err(), "non-hex character");
+
+        // A genuine 64-hex-digit hash still works normally.
+        let real_hash = "a".repeat(64);
+        store.write_chunk(&real_hash, b"real bytes").expect("a well-formed hash is accepted");
+        assert_eq!(store.read_chunk(&real_hash).unwrap(), b"real bytes");
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    #[test]
+    fn has_chunk_and_read_chunk_also_refuse_a_malformed_hash() {
+        let store = temp_store();
+        assert!(!store.has_chunk("../../../etc/passwd"), "malformed hash is never reported as present");
+        assert_eq!(
+            store.read_chunk("../../../etc/passwd").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+            "malformed hash is refused, not passed through to fs::read"
+        );
+        let _ = fs::remove_dir_all(&store.root);
+    }
 }
