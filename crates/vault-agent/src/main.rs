@@ -20,7 +20,7 @@
 //!   scripts/serve-vault-gossip.sh). This is ARCHITECTURE.md §7 step 2.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -203,27 +203,25 @@ fn run_dial_cmd(cmd: &str, input: &str, timeout: Duration) -> io::Result<String>
         let _ = stdin.write_all(input.as_bytes());
     }
 
+    // Drain stdout/stderr on their own threads, concurrently with waiting for
+    // exit below. The OS pipe buffer is typically 64KiB; a gossip response
+    // larger than that (routine for a real manifest snapshot or a chunk-fetch
+    // batch -- even one max-size 64KiB chunk is ~87KB once base64-encoded)
+    // fills the pipe and blocks the child's write() before it can exit, so a
+    // reader that only runs *after* `try_wait` sees `Some` would deadlock
+    // every such call until `timeout` kills it. Bounded via
+    // wire::read_bounded_to_string for the same reason as every other
+    // network-facing read in this crate: the bytes on the other end of
+    // stdout are a peer's gossip response.
+    let mut out = child.stdout.take().expect("stdout was piped");
+    let stdout_thread = std::thread::spawn(move || wire::read_bounded_to_string(&mut out));
+    let mut err = child.stderr.take().expect("stderr was piped");
+    let stderr_thread = std::thread::spawn(move || wire::read_bounded_to_string(&mut err));
+
     let start = Instant::now();
-    loop {
+    let status = loop {
         if let Some(status) = child.try_wait()? {
-            let mut stdout = String::new();
-            if let Some(mut out) = child.stdout.take() {
-                let _ = out.read_to_string(&mut stdout);
-            }
-            if !status.success() {
-                let mut stderr = String::new();
-                if let Some(mut err) = child.stderr.take() {
-                    let _ = err.read_to_string(&mut stderr);
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("dial command exited {:?}: {}", status.code(), stderr.trim()),
-                ));
-            }
-            if stdout.trim().is_empty() {
-                return Err(io::Error::new(io::ErrorKind::Other, "dial command produced no output"));
-            }
-            return Ok(stdout);
+            break status;
         }
         if start.elapsed() > timeout {
             let _ = child.kill();
@@ -231,6 +229,41 @@ fn run_dial_cmd(cmd: &str, input: &str, timeout: Duration) -> io::Result<String>
             return Err(io::Error::new(io::ErrorKind::TimedOut, format!("dial command timed out after {timeout:?}")));
         }
         std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let stdout = stdout_thread.join().unwrap_or_else(|_| Ok(String::new())).unwrap_or_default();
+    if !status.success() {
+        let stderr = stderr_thread.join().unwrap_or_else(|_| Ok(String::new())).unwrap_or_default();
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("dial command exited {:?}: {}", status.code(), stderr.trim()),
+        ));
+    }
+    if stdout.trim().is_empty() {
+        return Err(io::Error::new(io::ErrorKind::Other, "dial command produced no output"));
+    }
+    Ok(stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_dial_cmd_does_not_deadlock_on_a_response_larger_than_one_pipe_buffer() {
+        // 64KiB is the typical Linux pipe buffer; write comfortably more than
+        // that to prove the reader drains concurrently with the child
+        // running instead of only after it exits.
+        let out = run_dial_cmd("yes x | head -c 200000", "", Duration::from_secs(10))
+            .expect("a large response must not time out or deadlock");
+        assert_eq!(out.len(), 200000);
+    }
+
+    #[test]
+    fn run_dial_cmd_still_reports_a_failing_command() {
+        let err = run_dial_cmd("echo boom >&2; exit 1", "", Duration::from_secs(5))
+            .expect_err("a nonzero exit must be reported as an error");
+        assert!(err.to_string().contains("boom"), "stderr is included: {err}");
     }
 }
 
