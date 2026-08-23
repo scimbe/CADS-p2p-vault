@@ -10,14 +10,14 @@
 //! the agent process (see `vault_agent::store::Store::{load,save}_manifest`).
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
 use vault_agent::store::Store;
-use vault_agent::wire::{GossipRequest, GossipResponse};
+use vault_agent::wire::{self, GossipRequest, GossipResponse};
 
 fn to_io_err<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
@@ -36,8 +36,11 @@ fn parse_dir() -> PathBuf {
 fn main() -> io::Result<()> {
     let dir = parse_dir();
 
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
+    // Bounded (wire::read_bounded_to_string): the caller (`ct-agent channel accept`)
+    // pipes an arbitrary peer's request straight to this process's stdin -- an
+    // unbounded `read_to_string` would let a malicious/misbehaving peer grow this
+    // process's memory without limit on every invocation.
+    let input = wire::read_bounded_to_string(&mut io::stdin())?;
     let req: GossipRequest = serde_json::from_str(input.trim()).map_err(to_io_err)?;
 
     let store = Store::open(dir)?;

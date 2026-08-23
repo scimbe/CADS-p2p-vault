@@ -33,7 +33,7 @@ use vault_manifest::hlc::Hlc;
 use vault_manifest::manifest::Manifest;
 
 use vault_agent::store::{self, Store};
-use vault_agent::wire::{GossipRequest, GossipResponse};
+use vault_agent::wire::{self, GossipRequest, GossipResponse};
 
 struct Args {
     id: String,
@@ -96,9 +96,11 @@ fn write_line<T: serde::Serialize>(stream: &mut TcpStream, msg: &T) -> io::Resul
 }
 
 fn read_line<R: BufRead>(reader: &mut R) -> io::Result<String> {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
-    if n == 0 {
+    // Bounded (wire::read_bounded_line): plain TCP has no auth at all on this
+    // transport, so an unbounded `read_line` would let any reachable peer grow this
+    // process's memory without limit just by never sending a newline.
+    let line = wire::read_bounded_line(reader)?;
+    if line.is_empty() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed the connection"));
     }
     Ok(line)
